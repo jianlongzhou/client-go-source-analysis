@@ -1,4 +1,6 @@
-## 以下分析：利用已有的dpeloyment资源，实现自定义controller逻辑
+![image](https://user-images.githubusercontent.com/41672087/116676748-efbbed00-a9d9-11eb-88ff-2b25120b59b3.png)
+
+## 以下分析：利用已有的deployment资源，实现自定义controller逻辑
 ```go
 kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
 controller := NewController(
