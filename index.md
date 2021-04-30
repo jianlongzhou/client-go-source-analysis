@@ -1,6 +1,6 @@
 ![image](https://user-images.githubusercontent.com/41672087/116676748-efbbed00-a9d9-11eb-88ff-2b25120b59b3.png)
 
-## 以下分析：以deployment controller为例分析client-go用法
+## 以deployment controller为例分析其中client-go的用法
 ```go
 kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
 controller := NewController(
