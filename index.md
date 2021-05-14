@@ -17,10 +17,11 @@ if err = controller.Run(2, stopCh); err != nil {
 
 ### SharedInformerFactory结构
 
-kubeClient:clientset
-defaultResync:30s
 使用sharedInformerFactory的好处：比如很多个模块都需要使用pod对象，没必要都创建一个pod informer，用factor存储每种资源的一个informer，这里的informer实现是shareIndexInformer
 NewSharedInformerFactory调用了NewSharedInformerFactoryWithOptions，将返回一个sharedInformerFactory对象
+
+> kubeClient:clientset
+> defaultResync:30s
 
 ```go
 type sharedInformerFactory struct {
@@ -249,7 +250,9 @@ sharedIndexInformer对象的关键方法：
 
 前面factory的start方法就是调用了这个Run方法
 
-该方法初始化了controller对象请启动，同时调用processor.run启动所有的listener，回调用户配置的EventHandler
+该方法初始化了controller对象并启动，同时调用processor.run启动所有的listener，用于回调用户配置的EventHandler
+
+具体sharedIndexInformer中的processor中的listener是怎么添加的，看下文shareProcessor的分析
 
 ```go
 func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
@@ -264,7 +267,7 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
       FullResyncPeriod: s.resyncCheckPeriod, // 30s
       RetryOnError:     false,
       ShouldResync:     s.processor.shouldResync,
-
+      //一个知道如何处理从informer中的controller中的deltaFIFO pop出来的对象的方法
       Process: s.HandleDeltas,
    }
 
@@ -292,7 +295,11 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 
 #### 为shareIndexInformer创建controller
 
-创建Controller的New方法会生成一个controller对象，只初始化controller的config对象，controller的reflector对象是在Run的时候初始化，并且通过不断执行processLoop方法，从DeltaFIFO pop出对象，再调用reflector的Process（其实是shareIndexInformer的HandleDeltas方法）处理
+创建Controller的New方法会生成一个controller对象，只初始化controller的config成员，controller的reflector成员是在Run的时候初始化：
+
+- 通过执行reflector.Run方法启动reflector，开启对指定对象的listAndWatch过程，获取的对象将添加到reflector的deltaFIFO中
+
+- 通过不断执行processLoop方法，从DeltaFIFO pop出对象，再调用reflector的Process（就是shareIndexInformer的HandleDeltas方法）处理
 
 ```go
 func New(c *Config) Controller {
@@ -327,12 +334,33 @@ func (c *controller) Run(stopCh <-chan struct{}) {
 }
 ```
 
-#### DeltaFIFO pop出来的对象处理逻辑
+#### controller的processLoop方法
+
+不断执行processLoop，这个方法其实就是从DeltaFIFO pop出对象，再调用reflector的Process（其实是shareIndexInformer的HandleDeltas方法）处理
+
+```
+func (c *controller) processLoop() {
+   for {
+      obj, err := c.config.Queue.Pop(PopProcessFunc(c.config.Process))
+      if err != nil {
+         if err == ErrFIFOClosed {
+            return
+         }
+         if c.config.RetryOnError {
+            // This is the safe way to re-enqueue.
+            c.config.Queue.AddIfNotPresent(obj)
+         }
+      }
+   }
+}
+```
+
+#### deltaFIFO pop出来的对象处理逻辑
 
 先看看controller怎么处理DeltaFIFO中的对象，需要注意DeltaFIFO中的Deltas的结构，是一个slice，保存同一个对象的所有增量事件
 ![image](https://user-images.githubusercontent.com/41672087/116666059-19224c00-a9cd-11eb-945c-955cce9eacd1.png)
 
-
+sharedIndexInformer的HandleDeltas处理从deltaFIFO pod出来的增量时，先尝试更新到本地缓存cache，更新成功的话会调用processor.distribute方法向processor中的listener添加notification，listener启动之后会不断获取notification回调用户的EventHandler方法
 
 ```go
 func (s *sharedIndexInformer) HandleDeltas(obj interface{}) error {
@@ -369,7 +397,16 @@ func (s *sharedIndexInformer) HandleDeltas(obj interface{}) error {
 }
 ```
 
+
+
+前面描述了shareIndexInformer内部如何从deltaFIFO取出对象更新缓存并通过processor回调用户的EventHandler，那deltaFIFO中的增量事件是怎么加进入的呢？先看看shareIndexInformer中controller中的reflector实现
+
 #### reflector.run发起ListWatch
+
+reflector.run将会调用指定资源的ListAndWatch方法
+
+- 以ResourceVersion=0开始首次的List操作获取指定资源的全量对象，并通过reflector的syncWith方法将所有对象批量插入deltaFIFO
+- List完成之后将会更新ResourceVersion用户Watch操作，通过reflector的watchHandler方法把watch到的增量对象加入到deltaFIFO
 
 ```go
 func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
@@ -418,10 +455,65 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 }
 ```
 
+##### list出的对象批量插入deltaFIFO
+
+> 可以看到是syncWith方法是通过调用deltaFIFO的Replace实现批量插入，具体实现见下文中deltaFIFO的实现描述
+
+```go
+func (r *Reflector) syncWith(items []runtime.Object, resourceVersion string) error {
+	found := make([]interface{}, 0, len(items))
+	for _, item := range items {
+		found = append(found, item)
+	}
+	return r.store.Replace(found, resourceVersion)
+}
+```
+
+##### watch出的增量对象插入到deltaFIFO
+
+> watch到的对象直接根据watch到的事件类型eventType更新store（即deltaFIFO）
+
+```go
+// watchHandler watches w and keeps *resourceVersion up to date.
+func (r *Reflector) watchHandler(start time.Time, w watch.Interface, resourceVersion *string, errc chan error, stopCh <-chan struct{}) error {
+	for {
+		select {
+		case <-stopCh:
+			return errorStopRequested
+		case err := <-errc:
+			return err
+		case event, ok := <-w.ResultChan():
+			switch event.Type {
+			case watch.Added:
+				err := r.store.Add(event.Object)
+				if err != nil {
+					utilruntime.HandleError(fmt.Errorf("%s: unable to add watch event object (%#v) to store: %v", r.name, event.Object, err))
+				}
+			case watch.Modified:
+				err := r.store.Update(event.Object)
+				if err != nil {
+					utilruntime.HandleError(fmt.Errorf("%s: unable to update watch event object (%#v) to store: %v", r.name, event.Object, err))
+				}
+			case watch.Deleted:
+				err := r.store.Delete(event.Object)
+				if err != nil {
+					utilruntime.HandleError(fmt.Errorf("%s: unable to delete watch event object (%#v) from store: %v", r.name, event.Object, err))
+				}
+			case watch.Bookmark:
+				// A `Bookmark` means watch has synced here, just update the resourceVersion
+			default:
+				utilruntime.HandleError(fmt.Errorf("%s: unable to understand watch event %#v", r.name, event))
+			}
+			*resourceVersion = newResourceVersion
+			r.setLastSyncResourceVersion(newResourceVersion)
+		}
+	}
+}
+```
+
 ### 底层缓存的实现
 
-shareIndexInformer中带有一个缓存indexer
-查看最前面的类图，我们可以知道：
+shareIndexInformer中带有一个缓存indexer，是一个支持索引的map，优点是支持快速查询，参考类图，我们可以知道：
 
 - Indexer、Queue接口和cache结构体都实现了顶层的Store接口
 - cache结构体持有threadSafeStore对象，该结构体是线程安全的，具备索引查找能力的map
@@ -458,6 +550,8 @@ type Index map[string]sets.String
 #### 缓存中增加对象
 
 以向上面的结构中增加一个对象为例
+
+> 所谓带索引的缓存，其实就是在crud对象的时候，维护对应的索引结构
 
 ```go
 func (c *threadSafeMap) Add(key string, obj interface{}) {
@@ -571,7 +665,7 @@ func (c *threadSafeMap) Index(indexName string, obj interface{}) ([]interface{},
 }
 ```
 
-### reflector中的deltaFIFO实现
+### deltaFIFO实现
 
 shareIndexInformer.controller.reflector中的deltaFIFO实现
 
@@ -630,92 +724,11 @@ type Deltas []Delta
 
 DeltaFIFO关键的方法：
 
-> 每次从DeltaFIFO Pop出一个对象，f.initialPopulationCount会减一，初始值为List时的对象数量
-> 前面的Informer的WaitForCacheSync最终就是调用了这个HasSynced方法，因为前面Pop出对象的处理方法HandleDeltas中，
-> 会先调用indexder把对象存起来，所以这个HasSynced相当于判断本地缓存是否首次同步完成
-
-#### deltaFIFO是否sync
-
-即从reflector list到的数据是否pop完
-
-```go
-func (f *DeltaFIFO) HasSynced() bool {
-   f.lock.Lock()
-   defer f.lock.Unlock()
-   return f.populated && f.initialPopulationCount == 0
-}
-
-在队列中给指定的对象append一个Delta
-func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) error {
-   id, err := f.KeyOf(obj)
-   if err != nil {
-      return KeyError{obj, err}
-   }
-
-   newDeltas := append(f.items[id], Delta{actionType, obj})
-   newDeltas = dedupDeltas(newDeltas)
-
-   if len(newDeltas) > 0 {
-      if _, exists := f.items[id]; !exists {
-         f.queue = append(f.queue, id)
-      }
-      f.items[id] = newDeltas
-      f.cond.Broadcast()
-   } else {
-      // We need to remove this from our map (extra items in the queue are
-      // ignored if they are not in the map).
-      delete(f.items, id)
-   }
-   return nil
-}
-```
-
-#### 从deltaFIFO pop出对象
-
-从队列中Pop出一个方法，并由函数process来处理，就是shareIndexInformer的HandleDeltas
-
-```go
-func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
-   f.lock.Lock()
-   defer f.lock.Unlock()
-   for {
-      for len(f.queue) == 0 {
-         // When the queue is empty, invocation of Pop() is blocked until new item is enqueued.
-         // When Close() is called, the f.closed is set and the condition is broadcasted.
-         // Which causes this loop to continue and return from the Pop().
-         if f.IsClosed() {
-            return nil, ErrFIFOClosed
-         }
-
-         f.cond.Wait()
-      }
-      id := f.queue[0]
-      f.queue = f.queue[1:]
-      if f.initialPopulationCount > 0 {
-         f.initialPopulationCount--
-      }
-      item, ok := f.items[id]
-      if !ok {
-         // Item may have been deleted subsequently.
-         continue
-      }
-      delete(f.items, id)
-      err := process(item)
-      // 如果没有处理成功，那么就会重新加到deltaFIFO队列中
-      if e, ok := err.(ErrRequeue); ok {
-         f.addIfNotPresent(id, item)
-         err = e.Err
-      }
-      // Don't need to copyDeltas here, because we're transferring
-      // ownership to the caller.
-      return item, err
-   }
-}
-```
-
 #### 向deltaFIFO批量插入对象
 
-批量向队列插入数据的方法，当有knownObjects存在时，knownObjects才表示已有数据
+批量向队列插入数据的方法，注意knownObjects是本地缓存indexer的引用
+
+这里会更新deltaFIFO的initialPopulationCount为Replace进去的对象总数
 
 ```go
 func (f *DeltaFIFO) Replace(list []interface{}, resourceVersion string) error {
@@ -789,7 +802,7 @@ func (f *DeltaFIFO) Replace(list []interface{}, resourceVersion string) error {
          return err
       }
    }
-     // 设置f.initialPopulationCount，大于0表示首次插入的对象还没有pop出去
+     // 设置f.initialPopulationCount，大于0表示首次插入的对象还没有全部pop出去
    if !f.populated {
       f.populated = true
       f.initialPopulationCount = len(list) + queuedDeletions
@@ -799,10 +812,109 @@ func (f *DeltaFIFO) Replace(list []interface{}, resourceVersion string) error {
 }
 ```
 
-#### Resync方法
+
+
+#### 从deltaFIFO pop出对象
+
+从队列中Pop出一个方法，并由函数process来处理，就是shareIndexInformer的HandleDeltas
+
+> 每次从DeltaFIFO Pop出一个对象，f.initialPopulationCount会减一，初始值为List时的对象数量
+> 前面的Informer的WaitForCacheSync最终就是调用了这个HasSynced方法
+>
+> 因为前面Pop出对象的处理方法HandleDeltas中，会先调用indexder把对象存起来，所以这个HasSynced相当于判断本地缓存是否首次同步完成
 
 ```go
-// 所谓的resync，其实就是把knownObjects即缓存中的对象全部再通过queueActionLocked(Sync, obj)加到队列
+func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
+   f.lock.Lock()
+   defer f.lock.Unlock()
+   for {
+      for len(f.queue) == 0 {
+         // When the queue is empty, invocation of Pop() is blocked until new item is enqueued.
+         // When Close() is called, the f.closed is set and the condition is broadcasted.
+         // Which causes this loop to continue and return from the Pop().
+         if f.IsClosed() {
+            return nil, ErrFIFOClosed
+         }
+
+         f.cond.Wait()
+      }
+      //取出队首元素
+      id := f.queue[0]
+      //去掉队首元素
+      f.queue = f.queue[1:]
+      //首次填充的对象数减一
+      if f.initialPopulationCount > 0 {
+         f.initialPopulationCount--
+      }
+      item, ok := f.items[id]
+      if !ok {
+         // Item may have been deleted subsequently.
+         continue
+      }
+      delete(f.items, id)
+      //处理增量对象
+      err := process(item)
+      // 如果没有处理成功，那么就会重新加到deltaFIFO队列中
+      if e, ok := err.(ErrRequeue); ok {
+         f.addIfNotPresent(id, item)
+         err = e.Err
+      }
+      // Don't need to copyDeltas here, because we're transferring
+      // ownership to the caller.
+      return item, err
+   }
+}
+```
+
+
+
+#### deltaFIFO是否同步完成
+
+对应到前面遗留的没有串起来的问题：factory的WaitForCacheSync是如何等待缓存同步完成：
+
+> factory的WaitForCacheSync方法调用informer的HasSync方法，继而调用deltaFIFO的HasSync方法，也就是判断从reflector list到的数据是否pop完
+
+```go
+func (f *DeltaFIFO) HasSynced() bool {
+   f.lock.Lock()
+   defer f.lock.Unlock()
+   return f.populated && f.initialPopulationCount == 0
+}
+```
+
+#### deltaFIFO增加一个对象
+
+```go
+//在队列中给指定的对象append一个Delta
+func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) error {
+   id, err := f.KeyOf(obj)
+   if err != nil {
+      return KeyError{obj, err}
+   }
+
+   newDeltas := append(f.items[id], Delta{actionType, obj})
+   newDeltas = dedupDeltas(newDeltas)
+
+   if len(newDeltas) > 0 {
+      if _, exists := f.items[id]; !exists {
+         f.queue = append(f.queue, id)
+      }
+      f.items[id] = newDeltas
+      f.cond.Broadcast()
+   } else {
+      // We need to remove this from our map (extra items in the queue are
+      // ignored if they are not in the map).
+      delete(f.items, id)
+   }
+   return nil
+}
+```
+
+#### Resync方法
+
+> 所谓的resync，其实就是把knownObjects即缓存中的对象全部再通过queueActionLocked(Sync, obj)加到队列
+
+```go
 func (f *DeltaFIFO) Resync() error {
    f.lock.Lock()
    defer f.lock.Unlock()
@@ -845,6 +957,8 @@ func (f *DeltaFIFO) syncKeyLocked(key string) error {
 }
 ```
 
+### 
+
 ### shareProcess结构
 
 shareIndexInformer中具有一个shareProcess结构，用于分发deltaFIFO的对象，调用用户配置的EventHandler处理
@@ -854,8 +968,6 @@ shareIndexInformer中具有一个shareProcess结构，用于分发deltaFIFO的�
 
 > listenersStarted：listeners中包含的listener是否都已经启动了
 > listeners：已添加的listener
-> syncingListeners：正在处于同步状态的listener
-> listeners和syncingListeners保存的listener是一致的，区别在于当从deltaFIFO分发过来的对象是由resync触发的，那么会由syncingListeners的来处理
 
 ```go
 // NewSharedIndexInformer creates a new instance for the listwatcher.
@@ -922,6 +1034,8 @@ func (p *sharedProcessor) run(stopCh <-chan struct{}) {
 ```
 
 #### sharedProcessor分发对象
+
+distribute方法是在前面介绍[deltaFIFO pop出来的对象处理逻辑]时提到的，把notification事件添加到listener中，listener如何pop出notification回调EventHandler见下文listener分析
 
 ```go
 func (p *sharedProcessor) distribute(obj interface{}, sync bool) {
