@@ -1,6 +1,7 @@
 ![image](https://user-images.githubusercontent.com/41672087/116676748-efbbed00-a9d9-11eb-88ff-2b25120b59b3.png)
 
-## 以deployment controller为例分析其中client-go的用法
+## 以deployment controller为例分析其中client-go informer的用法
+
 ```go
 kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
 controller := NewController(
@@ -13,11 +14,14 @@ if err = controller.Run(2, stopCh); err != nil {
    klog.Fatalf("Error running controller: %s", err.Error())
 }
 ```
+
 ### SharedInformerFactory结构
+
 kubeClient:clientset
 defaultResync:30s
 使用sharedInformerFactory的好处：比如很多个模块都需要使用pod对象，没必要都创建一个pod informer，用factor存储每种资源的一个informer，这里的informer实现是shareIndexInformer
 NewSharedInformerFactory调用了NewSharedInformerFactoryWithOptions，将返回一个sharedInformerFactory对象
+
 ```go
 type sharedInformerFactory struct {
    client           kubernetes.Interface //clientset
@@ -25,7 +29,7 @@ type sharedInformerFactory struct {
    tweakListOptions internalinterfaces.TweakListOptionsFunc
    lock             sync.Mutex
    defaultResync    time.Duration //前面传过来的时间，如30s
-   customResync     map[reflect.Type]time.Duration //针对每一个informer，用户配置的resync时间，通过WithCustomResyncConfig这个Option配置
+   customResync     map[reflect.Type]time.Duration //针对每一个informer，用户配置的resync时间，通过WithCustomResyncConfig这个Option配置，否则就用指定的defaultResync
 
    informers map[reflect.Type]cache.SharedIndexInformer //针对每种类型资源存储一个informer，informer的类型是ShareIndexInformer
    // startedInformers is used for tracking which informers have been started.
@@ -35,13 +39,16 @@ type sharedInformerFactory struct {
 ```
 
 sharedInformerFactory对象的关键方法：
+
 #### 创建一个sharedInformerFactory
+
 ```go
 func NewSharedInformerFactoryWithOptions(client kubernetes.Interface, defaultResync time.Duration, options ...SharedInformerOption) SharedInformerFactory {
    factory := &sharedInformerFactory{
-      client:           client,
+      client:           client,          //clientset，对deployment资源来说，这里就可以直接使用kube clientset
       namespace:        v1.NamespaceAll, //可以看到默认是监听所有ns下的指定资源
-      defaultResync:    defaultResync,
+      defaultResync:    defaultResync,   //30s
+      //以下初始化map结构
       informers:        make(map[reflect.Type]cache.SharedIndexInformer),
       startedInformers: make(map[reflect.Type]bool),
       customResync:     make(map[reflect.Type]time.Duration),
@@ -51,6 +58,7 @@ func NewSharedInformerFactoryWithOptions(client kubernetes.Interface, defaultRes
 ```
 
 #### 启动factory下的所有informer
+
 ```go
 func (f *sharedInformerFactory) Start(stopCh <-chan struct{}) {
    f.lock.Lock()
@@ -58,7 +66,7 @@ func (f *sharedInformerFactory) Start(stopCh <-chan struct{}) {
 
    for informerType, informer := range f.informers {
       if !f.startedInformers[informerType] {
-//调用放入是informer的Run方法，具体实现看下面
+         //直接起gorouting调用informer的Run方法，并且标记对应的informer已经启动
          go informer.Run(stopCh)
          f.startedInformers[informerType] = true
       }
@@ -67,10 +75,20 @@ func (f *sharedInformerFactory) Start(stopCh <-chan struct{}) {
 ```
 
 #### 等待ShareIndexInformer的cache被同步
-等待每一个ShareIndexInformer的cache被同步，具体怎么算同步其实是看ShareIndexInformer里面的store对象的实现
+
+等待每一个ShareIndexInformer的cache被同步，具体怎么算同步完成呢？
+
+- sharedInformerFactory的WaitForCacheSync将会不断调用factory持有的所有informer的HasSynced方法，直到返回true
+
+- 而informer的HasSynced方法调用的自己持有的controller的HasSynced方法（informer结构体包含controller对象，下文会分析informer的结构）
+
+- informer中的controller的HasSynced方法则调用的是controller持有的deltaFIFO对象的HasSynced方法
+
+也就说sharedInformerFactory的WaitForCacheSync方法判断informer的cache是否同步，看的是informer中的deltaFIFO是否同步了，deltaFIFO的结构下文将会分析
+
 ```go
 func (f *sharedInformerFactory) WaitForCacheSync(stopCh <-chan struct{}) map[reflect.Type]bool {
-//获取每一个已经启动的informer
+   //获取每一个已经启动的informer
    informers := func() map[reflect.Type]cache.SharedIndexInformer {
       f.lock.Lock()
       defer f.lock.Unlock()
@@ -85,7 +103,7 @@ func (f *sharedInformerFactory) WaitForCacheSync(stopCh <-chan struct{}) map[ref
    }()
 
    res := map[reflect.Type]bool{}
-   // 等待他们的cache被同步，具体怎么同步的看下面informer的实现
+   // 等待他们的cache被同步，调用的是informer的HasSynced方法
    for informType, informer := range informers {
       res[informType] = cache.WaitForCacheSync(stopCh, informer.HasSynced)
    }
@@ -94,9 +112,12 @@ func (f *sharedInformerFactory) WaitForCacheSync(stopCh <-chan struct{}) map[ref
 ```
 
 #### factory为自己添加informer
-添加完成之后，上面factory的start方法就可以启动了
-obj:如deployment{}
-newFunc:一个可以用来创建指定informer的方法，k8s为每一个内置的对象都实现了这个方法，比如创建deployment的ShareIndexInformer的方法
+
+只有向factory中添加informer，factory才有意义，添加完成之后，上面factory的start方法就可以启动了
+
+> obj:如deployment{}
+> newFunc:一个可以用来创建指定informer的方法，k8s为每一个内置的对象都实现了这个方法，比如创建deployment的ShareIndexInformer的方法
+
 ```go
 func (f *sharedInformerFactory) InformerFor(obj runtime.Object, newFunc internalinterfaces.NewInformerFunc) cache.SharedIndexInformer {
    f.lock.Lock()
@@ -107,7 +128,7 @@ func (f *sharedInformerFactory) InformerFor(obj runtime.Object, newFunc internal
    if exists {
       return informer
    }
-
+   //如果factory中已经有这个对象类型的informer，就不创建了
    resyncPeriod, exists := f.customResync[informerType]
    if !exists {
       resyncPeriod = f.defaultResync
@@ -121,13 +142,42 @@ func (f *sharedInformerFactory) InformerFor(obj runtime.Object, newFunc internal
 ```
 
 ##### deployment的shareIndexInformer对应的newFunc的实现
-```go
-//可以看到创建deploymentInformer时传递了一个带索引的缓存，附带了一个namespace索引，后面可以了解带索引的缓存实现，比如可以支持查询：某个namespace下的所有pod
-func (f *deploymentInformer) defaultInformer(client kubernetes.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-   return NewFilteredDeploymentInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
-}
 
-// 先看看下面的shareIndexInformer结构
+client-go中已经为所有内置对象都提供了NewInformerFunc
+
+以deployment为例，通过调用factory.Apps().V1().Deployments()即可为factory添加一个deployment对应的shareIndexInformer的实现，具体过程如下：
+
+- 调用factory.Apps().V1().Deployments()即会调用以下Deployments方法创建deploymentInformer对象
+
+```go
+func (v *version) Deployments() DeploymentInformer {
+	return &deploymentInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+```
+
+- 只要调用了factory.Apps().V1().Deployments()返回的deploymentInformer的Informer或Lister方法，就完成了向factory中添加deployment informer
+
+```go
+//即会调用以下Deployments方法创建deploymentInformer对象具有defaultInformer、Informer、Lister方法
+//可以看到创建deploymentInformer时传递了一个带索引的缓存，附带了一个namespace索引，后面可以了解带索引的缓存实现，比如可以支持查询：某个namespace下的所有pod
+//用于创建对应的shareIndexInformer，该方法提供给factory的InformerFor方法
+func (f *deploymentInformer) defaultInformer(client kubernetes.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
+	return NewFilteredDeploymentInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+}
+//向factor中添加dpeloyment的shareIndexInformer并返回
+func (f *deploymentInformer) Informer() cache.SharedIndexInformer {
+	return f.factory.InformerFor(&appsv1.Deployment{}, f.defaultInformer)
+}
+//返回dpeloyment的lister对象，该lister中持有上面创建出的shareIndexInformer的cache的引用，方便通过缓存获取对象
+func (f *deploymentInformer) Lister() v1.DeploymentLister {
+	return v1.NewDeploymentLister(f.Informer().GetIndexer())
+}
+```
+
+- deploymentInformer的defaultInformer方法将会创建出一个shareIndexInformer
+
+```go
+// 可先看看下面的shareIndexInformer结构
 func NewFilteredDeploymentInformer(client kubernetes.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
    return cache.NewSharedIndexInformer(
       //定义对象的ListWatch方法，这里直接用的是clientset中的方法
@@ -153,23 +203,25 @@ func NewFilteredDeploymentInformer(client kubernetes.Interface, namespace string
 ```
 
 ### shareIndexInformer结构
-indexer：底层缓存，其实就是一个map记录对象，再通过一些其他map在插入删除对象是根据索引函数维护索引key如ns与对象pod的关系
-controller：informer内部的一个controller，这个controller包含reflector：根据用户定义的ListWatch方法获取对象并更新增量队列DeltaFIFO
-processor：知道如何处理DeltaFIFO队列中的对象，实现是sharedProcessor{}
-listerWatcher：知道如何list对象和watch对象的方法
-objectType：deployment{}
-resyncCheckPeriod: factory创建是指定的defaultResync，给自己的controller的reflector每隔多少s调用shouldResync
-defaultEventHandlerResyncPeriod：factory创建是指定的defaultResync，通过AddEventHandler增加的handler的resync默认值
+
+> indexer：底层缓存，其实就是一个map记录对象，再通过一些其他map在插入删除对象是根据索引函数维护索引key如ns与对象pod的关系
+> controller：informer内部的一个controller，这个controller包含reflector：根据用户定义的ListWatch方法获取对象并更新增量队列DeltaFIFO
+> processor：知道如何处理DeltaFIFO队列中的对象，实现是sharedProcessor{}
+> listerWatcher：知道如何list对象和watch对象的方法
+> objectType：deployment{}
+> resyncCheckPeriod: factory创建是指定的defaultResync，给自己的controller的reflector每隔多少s调用shouldResync
+> defaultEventHandlerResyncPeriod：factory创建是指定的defaultResync，通过AddEventHandler增加的handler的resync默认值
+
 ```go
 type sharedIndexInformer struct {
-   indexer    Indexer //informer中的底层缓存
-   controller Controller
+   indexer    Indexer //informer中的底层缓存cache
+   controller Controller //持有reflector和deltaFIFO对象，reflector对象将会listWatch对象添加到deltaFIFO，同时更新indexer cahce，更新成功则通过sharedProcessor触发用户配置的Eventhandler
 
-   processor             *sharedProcessor
+   processor             *sharedProcessor //持有一系列的listener，每个listener对应用户的EventHandler
    cacheMutationDetector MutationDetector //忽略，测试用
 
    // This block is tracked to handle late initialization of the controller
-   listerWatcher ListerWatcher
+   listerWatcher ListerWatcher //deployment的listWatch方法
    objectType    runtime.Object
 
    // resyncCheckPeriod is how often we want the reflector's resync timer to fire so it can call
@@ -190,14 +242,19 @@ type sharedIndexInformer struct {
    blockDeltas sync.Mutex
 }
 ```
+
 sharedIndexInformer对象的关键方法：
 
 #### sharedIndexInformer的Run方法
-前面factory的start就是调了这个
+
+前面factory的start方法就是调用了这个Run方法
+
+该方法初始化了controller对象请启动，同时调用processor.run启动所有的listener，回调用户配置的EventHandler
+
 ```go
 func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
    defer utilruntime.HandleCrash()
-   //创建一个DeltaFIFO，用于shareIndexInformer.controller.refector
+   //创建一个DeltaFIFO，用于shareIndexInformer.controller.reflector
    fifo := NewDeltaFIFO(MetaNamespaceKeyFunc, s.indexer)
    //shareIndexInformer中的controller的配置
    cfg := &Config{
@@ -225,7 +282,7 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
    var wg wait.Group
    defer wg.Wait()              // Wait for Processor to stop
    defer close(processorStopCh) // Tell Processor to stop
-   // 调用process.run启动所有的listener，回调用户配置的EventHandler
+   // 调用processor.run启动所有的listener，回调用户配置的EventHandler
    wg.StartWithChannel(processorStopCh, s.processor.run)
 
    // 启动controller
@@ -234,7 +291,9 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 ```
 
 #### 为shareIndexInformer创建controller
-创建Controller的New方法会生成一个reflector
+
+创建Controller的New方法会生成一个controller对象，只初始化controller的config对象，controller的reflector对象是在Run的时候初始化，并且通过不断执行processLoop方法，从DeltaFIFO pop出对象，再调用reflector的Process（其实是shareIndexInformer的HandleDeltas方法）处理
+
 ```go
 func New(c *Config) Controller {
    ctlr := &controller{
@@ -243,7 +302,7 @@ func New(c *Config) Controller {
    }
    return ctlr
 }
-更多字段的配置是在Run的时候
+//更多字段的配置是在Run的时候
 func (c *controller) Run(stopCh <-chan struct{}) {
    // 使用config创建一个Reflector
    r := NewReflector(
@@ -269,9 +328,12 @@ func (c *controller) Run(stopCh <-chan struct{}) {
 ```
 
 #### DeltaFIFO pop出来的对象处理逻辑
-先看看controller怎么处理DeltaFIFO中的对象
-注意DeltaFIFO中的Deltas的结构，是一个slice，保存同一个对象的所有增量事件
+
+先看看controller怎么处理DeltaFIFO中的对象，需要注意DeltaFIFO中的Deltas的结构，是一个slice，保存同一个对象的所有增量事件
 ![image](https://user-images.githubusercontent.com/41672087/116666059-19224c00-a9cd-11eb-945c-955cce9eacd1.png)
+
+
+
 ```go
 func (s *sharedIndexInformer) HandleDeltas(obj interface{}) error {
    s.blockDeltas.Lock()
@@ -308,6 +370,7 @@ func (s *sharedIndexInformer) HandleDeltas(obj interface{}) error {
 ```
 
 #### reflector.run发起ListWatch
+
 ```go
 func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
    // 以版本号ResourceVersion=0开始首次list
@@ -356,20 +419,23 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 ```
 
 ### 底层缓存的实现
+
 shareIndexInformer中带有一个缓存indexer
 查看最前面的类图，我们可以知道：
 
-Indexer、Queue接口和cache结构体都实现了顶层的Store接口
-cache结构体持有threadSafeStore对象，该结构体是线程安全的，具备索引查找能力的map
+- Indexer、Queue接口和cache结构体都实现了顶层的Store接口
+- cache结构体持有threadSafeStore对象，该结构体是线程安全的，具备索引查找能力的map
 
 threadSafeMap的结构如下：
-items:存储具体的对象，比如key为ns/podName，value为pod{}
-Indexers:一个map[string]IndexFunc结构，其中key为索引的名称，如’namespace’字符串，value则是一个具体的索引函数
-Indices:一个map[string]Index结构，其中key也是索引的名称，value是一个map[string]sets.String结构，其中key是具体的namespace，如default这个ns，vlaue则是这个ns下的按照索引函数求出来的值的集合，比如default这个ns下的所有pod对象名称
+
+> items:存储具体的对象，比如key为ns/podName，value为pod{}
+> Indexers:一个map[string]IndexFunc结构，其中key为索引的名称，如’namespace’字符串，value则是一个具体的索引函数
+> Indices:一个map[string]Index结构，其中key也是索引的名称，value是一个map[string]sets.String结构，其中key是具体的namespace，如default这个ns，vlaue则是这个ns下的按照索引函数求出来的值的集合，比如default这个ns下的所有pod对象名称
 
 通过在向items插入对象的过程中，遍历所有的Indexers中的索引函数，根据索引函数存储索引key到value的集合关系，以下图式结构可以很好的说明
 
 ![image](https://user-images.githubusercontent.com/41672087/116666278-5981ca00-a9cd-11eb-9570-8ee6eb447d05.png)
+
 ```go
 type threadSafeMap struct {
    lock  sync.RWMutex
@@ -390,7 +456,9 @@ type Index map[string]sets.String
 ```
 
 #### 缓存中增加对象
+
 以向上面的结构中增加一个对象为例
+
 ```go
 func (c *threadSafeMap) Add(key string, obj interface{}) {
    c.lock.Lock()
@@ -437,7 +505,9 @@ func (c *threadSafeMap) updateIndices(oldObj interface{}, newObj interface{}, ke
 ```
 
 #### MetaNamespaceIndexFunc索引函数
+
 一个典型的索引函数MetaNamespaceIndexFunc，方便查询时可以根据namespace获取该namespace下的所有对象
+
 ```go
 // MetaNamespaceIndexFunc is a default index function that indexes based on an object's namespace
 func MetaNamespaceIndexFunc(obj interface{}) ([]string, error) {
@@ -450,9 +520,15 @@ func MetaNamespaceIndexFunc(obj interface{}) ([]string, error) {
 ```
 
 #### Index方法利用索引查找对象
+
 提供利用索引来查询的能力，Index方法可以根据索引名称和对象，查询所有的关联对象
-例如通过Index(“namespace”, &metav1.ObjectMeta{Namespace: namespace})获取指定ns下的所有对象
-具体可以参考tools/cache/listers.go#ListAllByNamespace
+
+> 例如通过
+>
+> Index(“namespace”, &metav1.ObjectMeta{Namespace: namespace})
+>
+> 获取指定ns下的所有对象，具体可以参考tools/cache/listers.go#ListAllByNamespace
+
 ```go
 func (c *threadSafeMap) Index(indexName string, obj interface{}) ([]interface{}, error) {
    c.lock.RLock()
@@ -496,13 +572,16 @@ func (c *threadSafeMap) Index(indexName string, obj interface{}) ([]interface{},
 ```
 
 ### reflector中的deltaFIFO实现
+
 shareIndexInformer.controller.reflector中的deltaFIFO实现
-items：记录deltaFIFO中的对象，注意map的value是一个Delta slice
-queue：记录上面items中的key
-populated：队列中是否填充过数据，LIST时调用Replace或调用Delete/Add/Update都会置为true
-initialPopulationCount：前面首次List的时候获取到的数据就会调用Replace批量增加到队列，同时设置initialPopulationCount为List到的对象数量，每次Pop出来会减一，由于判断是否把首次批量插入的数据都POP出去了
-keyFunc：知道怎么从对象中解析出对应key的函数
-knownObjects：这个其实就是shareIndexInformer中的indexer底层缓存的引用，可以认为和etcd中的数据一致
+
+> items：记录deltaFIFO中的对象，注意map的value是一个Delta slice
+> queue：记录上面items中的key
+> populated：队列中是否填充过数据，LIST时调用Replace或调用Delete/Add/Update都会置为true
+> initialPopulationCount：前面首次List的时候获取到的数据就会调用Replace批量增加到队列，同时设置initialPopulationCount为List到的对象数量，每次Pop出来会减一，由于判断是否把首次批量插入的数据都POP出去了
+> keyFunc：知道怎么从对象中解析出对应key的函数
+> knownObjects：这个其实就是shareIndexInformer中的indexer底层缓存的引用，可以认为和etcd中的数据一致
+
 ```go
 type DeltaFIFO struct {
    // lock/cond protects access to 'items' and 'queue'.
@@ -550,12 +629,15 @@ type Deltas []Delta
 ```
 
 DeltaFIFO关键的方法：
-每次从DeltaFIFO Pop出一个对象，f.initialPopulationCount会减一，初始值为List时的对象数量
-前面的Informer的WaitForCacheSync最终就是调用了这个HasSynced方法，因为前面Pop出对象的处理方法HandleDeltas中，
-会先调用indexder把对象存起来，所以这个HasSynced相当于判断本地缓存是否首次同步完成
+
+> 每次从DeltaFIFO Pop出一个对象，f.initialPopulationCount会减一，初始值为List时的对象数量
+> 前面的Informer的WaitForCacheSync最终就是调用了这个HasSynced方法，因为前面Pop出对象的处理方法HandleDeltas中，
+> 会先调用indexder把对象存起来，所以这个HasSynced相当于判断本地缓存是否首次同步完成
 
 #### deltaFIFO是否sync
+
 即从reflector list到的数据是否pop完
+
 ```go
 func (f *DeltaFIFO) HasSynced() bool {
    f.lock.Lock()
@@ -589,7 +671,9 @@ func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) err
 ```
 
 #### 从deltaFIFO pop出对象
+
 从队列中Pop出一个方法，并由函数process来处理，就是shareIndexInformer的HandleDeltas
+
 ```go
 func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
    f.lock.Lock()
@@ -630,7 +714,9 @@ func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
 ```
 
 #### 向deltaFIFO批量插入对象
+
 批量向队列插入数据的方法，当有knownObjects存在时，knownObjects才表示已有数据
+
 ```go
 func (f *DeltaFIFO) Replace(list []interface{}, resourceVersion string) error {
    f.lock.Lock()
@@ -714,6 +800,7 @@ func (f *DeltaFIFO) Replace(list []interface{}, resourceVersion string) error {
 ```
 
 #### Resync方法
+
 ```go
 // 所谓的resync，其实就是把knownObjects即缓存中的对象全部再通过queueActionLocked(Sync, obj)加到队列
 func (f *DeltaFIFO) Resync() error {
@@ -759,14 +846,17 @@ func (f *DeltaFIFO) syncKeyLocked(key string) error {
 ```
 
 ### shareProcess结构
+
 shareIndexInformer中具有一个shareProcess结构，用于分发deltaFIFO的对象，调用用户配置的EventHandler处理
 
 可以看到shareIndexInformer中的process直接通过&sharedProcessor{clock: realClock}初始化
 如下为sharedProcessor结构：
-listenersStarted：listeners中包含的listener是否都已经启动了
-listeners：已添加的listener
-syncingListeners：正在处于同步状态的listener
-listeners和syncingListeners保存的listener是一致的，区别在于当从deltaFIFO分发过来的对象是由resync触发的，那么会由syncingListeners的来处理
+
+> listenersStarted：listeners中包含的listener是否都已经启动了
+> listeners：已添加的listener
+> syncingListeners：正在处于同步状态的listener
+> listeners和syncingListeners保存的listener是一致的，区别在于当从deltaFIFO分发过来的对象是由resync触发的，那么会由syncingListeners的来处理
+
 ```go
 // NewSharedIndexInformer creates a new instance for the listwatcher.
 func NewSharedIndexInformer(lw ListerWatcher, objType runtime.Object, defaultEventHandlerResyncPeriod time.Duration, indexers Indexers) SharedIndexInformer {
@@ -795,7 +885,9 @@ type sharedProcessor struct {
 ```
 
 #### 为sharedProcessor添加listener
+
 在sharedProcessor中添加一个listener
+
 ```go
 func (p *sharedProcessor) addListenerLocked(listener *processorListener) {
    p.listeners = append(p.listeners, listener)
@@ -804,8 +896,10 @@ func (p *sharedProcessor) addListenerLocked(listener *processorListener) {
 ```
 
 #### 启动sharedProcessor中的的listener
+
 sharedProcessor启动所有的listener，可以看到syncingListeners中的listener是没有被启动的
 是通过调用listener.run和listener.pop来启动一个listener，两个方法具体作用看下文processorListener说明
+
 ```go
 func (p *sharedProcessor) run(stopCh <-chan struct{}) {
    func() {
@@ -828,6 +922,7 @@ func (p *sharedProcessor) run(stopCh <-chan struct{}) {
 ```
 
 #### sharedProcessor分发对象
+
 ```go
 func (p *sharedProcessor) distribute(obj interface{}, sync bool) {
    p.listenersLock.RLock()
@@ -846,11 +941,14 @@ func (p *sharedProcessor) distribute(obj interface{}, sync bool) {
 ```
 
 ### processorListener结构
+
 sharedProcessor中的listener具体的类型：运转逻辑就是把用户通过addCh增加的事件发送到nextCh供run方法取出回调Eventhandler，因为addCh和nectCh都是无缓冲channel，所以中间引入ringBuffer做缓存
-processorListener是sharedIndexInformer调用AddEventHandler时创建并添加到sharedProcess
-对于一个Informer，可以多次调用AddEventHandler来添加多个listener，但我们的一般的使用场景应该都只会添加一个，作用都是类似enqueue到workQueue
-addCh和nextCh：都将被初始化为无缓冲的chan
-pendingNotifications：一个无容量限制的环形缓冲区，可以理解为可以无限存储的队列，用来存储deltaFIFO分发过来的消息
+
+> processorListener是sharedIndexInformer调用AddEventHandler时创建并添加到sharedProcess
+> 对于一个Informer，可以多次调用AddEventHandler来添加多个listener，但我们的一般的使用场景应该都只会添加一个，作用都是类似enqueue到workQueue
+> addCh和nextCh：都将被初始化为无缓冲的chan
+> pendingNotifications：一个无容量限制的环形缓冲区，可以理解为可以无限存储的队列，用来存储deltaFIFO分发过来的消息
+
 ```go
 type processorListener struct {
    nextCh chan interface{}
@@ -879,7 +977,9 @@ type processorListener struct {
 ```
 
 #### 在listener中添加事件
+
 shareProcessor中的distribute方法调用的是listener的add来向addCh增加消息，注意addCh是无缓冲的chan，依赖pop不断从addCh取出数据
+
 ```go
 func (p *processorListener) add(notification interface{}) {
    p.addCh <- notification
@@ -887,7 +987,9 @@ func (p *processorListener) add(notification interface{}) {
 ```
 
 #### listener的run方法回调EventHandler
+
 listener的run方法不断的从nextCh中获取notification，并根据notification的类型来调用用户自定的EventHandler
+
 ```go
 func (p *processorListener) run() {
    // this call blocks until the channel is closed.  When a panic happens during the notification
@@ -923,13 +1025,15 @@ func (p *processorListener) run() {
 ```
 
 #### pop方法：addCh到nextCh的对象传递
-这个pop的逻辑相对比较绕，最终目的就是把分发到addCh的数据从nextCh或者pendingNotifications取出来
-notification变量记录下一次要被放到p.nextCh供pop方法取出的对象
-开始seletct时必然只有case2可能ready
-Case2做的事可以描述为：从p.addCh获取对象，如果临时变量notification还是nil，说明需要往notification赋值，供case1推送到p.nextCh
-如果notification已经有值了，那个当前从p.addCh取出的值要先放到环形缓冲区中
 
-Case1做的事可以描述为：看看能不能把临时变量notification推送到nextCh（nil chan会阻塞在读写操作上），可以写的话，说明这个nextCh是p.nextCh，写成功之后，需要从缓存中取出一个对象放到notification为下次执行这个case做准备，如果缓存是空的，通过把nextCh chan设置为nil来禁用case1，以便case2位notification赋值
+这个pop的逻辑相对比较绕，最终目的就是把分发到addCh的数据从nextCh或者pendingNotifications取出来
+
+> notification变量记录下一次要被放到p.nextCh供pop方法取出的对象
+> 开始seletct时必然只有case2可能ready
+> Case2做的事可以描述为：从p.addCh获取对象，如果临时变量notification还是nil，说明需要往notification赋值，供case1推送到p.nextCh
+> 如果notification已经有值了，那个当前从p.addCh取出的值要先放到环形缓冲区中
+
+> Case1做的事可以描述为：看看能不能把临时变量notification推送到nextCh（nil chan会阻塞在读写操作上），可以写的话，说明这个nextCh是p.nextCh，写成功之后，需要从缓存中取出一个对象放到notification为下次执行这个case做准备，如果缓存是空的，通过把nextCh chan设置为nil来禁用case1，以便case2位notification赋值
 
 ```go
 func (p *processorListener) pop() {
